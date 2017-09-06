@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -159,6 +160,34 @@ vector<double> getXY(double s, double d, vector<double> maps_s, vector<double> m
 
 }
 
+std::vector<double> getFrontCarProximityAndVelocitySCoordinates(const vector<vector<double>> &sensor_fusion, int lane,
+                                                                double car_s,
+                                                                int prediction_horizon,
+                                                                double lane_width = 4.0,
+                                                                double lane_center_offset = 2.0,
+                                                                double lane_left_boundary = -3.0,
+                                                                double lane_right_boundary = 3.0,
+                                                                double frame_rate = 0.02);
+
+bool checkCanEscapeToLane(int lane, const vector<vector<double>> &sensor_fusion,
+                          double car_s,
+                          int prediction_horizon,
+                          double critical_overtake_free_space = 25.,
+                          double lane_width = 4.0,
+                          double lane_center_offset = 2.0,
+                          double lane_left_boundary = -3.0,
+                          double lane_right_boundary = 3.0,
+                          double frame_rate = 0.02);
+
+vector<vector<double>> getTwoStepTrajectoryHistory(double car_x, double car_y,
+                                                   double car_yaw, const vector<double> &previous_path_x,
+                                                   const vector<double> &previous_path_y);
+vector<vector<double>> getXYWaypointsAtFrenetSValues(double lane,
+                                                     const vector<double> &s_vector,
+                                                     const vector<double> &map_waypoints_s,
+                                                     const vector<double> &map_waypoints_x,
+                                                     const vector<double> &map_waypoints_y,
+                                                     double lane_width = 4., double lane_center_offset = 2.);
 int main() {
   uWS::Hub h;
 
@@ -196,7 +225,11 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+    int lane = 1;
+    double reference_velocity = 0;
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,
+                      &lane,&reference_velocity](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -235,15 +268,140 @@ int main() {
 
           	json msgJson;
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+
+            int prev_size = previous_path_x.size();
+            if (prev_size > 0) {
+                car_s = end_path_s;
+            }
+
+            double critical_front_car_separation = 15.;
+            double critical_overtake_free_space = 18.;
+            double max_speed = 49.;
+            double preferred_acceleration_rate = .6;
+
+            auto front_car_proximity_and_speed = getFrontCarProximityAndVelocitySCoordinates(sensor_fusion, lane,
+                                                                                         car_s, prev_size);
+
+            bool too_close = (front_car_proximity_and_speed[0] < critical_front_car_separation);
 
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
-          	msgJson["next_y"] = next_y_vals;
+            if (too_close) {
+                // check shifting down a lane
+                bool can_decrement = true;
+                if (lane <= 0) {
+                    can_decrement = false;
+                } else {
+                    can_decrement = checkCanEscapeToLane(lane-1,sensor_fusion,car_s,prev_size,
+                                                         critical_overtake_free_space);
+                }
 
-          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+                // check shifting up a lane
+                bool can_increment = true;
+                if (lane >= 2) {
+                    can_increment = false;
+                } else {
+                    can_increment = checkCanEscapeToLane(lane+1,sensor_fusion,car_s,prev_size,
+                                                         critical_overtake_free_space);
+                }
+
+                if (can_decrement) {
+                    lane--;
+                } else if (can_increment) {
+                    lane++;
+                }
+
+            }
+
+
+            if (too_close) {
+                if (reference_velocity > front_car_proximity_and_speed[1]) {
+                    reference_velocity -= preferred_acceleration_rate;
+                }
+            } else if ( reference_velocity < max_speed) {
+                reference_velocity += preferred_acceleration_rate;
+            }
+
+
+            auto local_trajectory_history = getTwoStepTrajectoryHistory( car_x,  car_y, deg2rad(car_yaw),previous_path_x, previous_path_y);
+
+            vector<double> ptsx = local_trajectory_history[0];
+            vector<double> ptsy = local_trajectory_history[1];
+
+            double ref_x = ptsx.back();
+            double ref_y = ptsy.back();
+            double ref_yaw;
+
+            if (prev_size < 2) {
+                ref_yaw = deg2rad(car_yaw);
+            } else {
+                ref_yaw = atan2( (ptsy[1] - ptsy[0]), (ptsx[1] - ptsx[0]) );
+            }
+
+
+            // obtain global trajectory points in xy coords and populate into spline tool buffer
+            vector<double> frenet_waypoints_s {car_s + 30, car_s + 60, car_s + 90 };
+            auto global_waypoints_xy = getXYWaypointsAtFrenetSValues(lane, frenet_waypoints_s,map_waypoints_s,
+                                                                  map_waypoints_x, map_waypoints_y);
+            copy(global_waypoints_xy[0].begin(), global_waypoints_xy[0].end(), back_inserter(ptsx));
+            copy(global_waypoints_xy[1].begin(), global_waypoints_xy[1].end(), back_inserter(ptsy));
+
+
+            // convert points to vehicle frame
+            for (int i = 0; i < ptsx.size(); i++) {
+                double shift_x = ptsx[i] - ref_x;
+                double shift_y = ptsy[i] - ref_y;
+
+                ptsx[i] = shift_x * cos(ref_yaw) + shift_y * sin(ref_yaw);
+                ptsy[i] = -shift_x * sin(ref_yaw) + shift_y * cos(ref_yaw);
+            }
+
+            // spline object for smooth trajectories
+            tk::spline s;
+            s.set_points(ptsx, ptsy);
+
+            // new path points in cartesian coords
+            vector<double> next_x_vals;
+            vector<double> next_y_vals;
+
+            // populate with previous path
+            for (int i = 0; i < previous_path_x.size(); i++) {
+                next_x_vals.push_back(previous_path_x[i]);
+                next_y_vals.push_back(previous_path_y[i]);
+            }
+
+            // interpolate 30 meters ahead using the spline tool
+            double target_x = 30.0;
+            double target_y = s(target_x);
+            double target_dist = sqrt(target_x*target_x + target_y*target_y);
+            double x_add_on = 0;
+
+            // generate new trajectory points using the spline tool
+            for ( int i = 1; i < 50 - prev_size; i++) {
+                double N = (target_dist/ (0.02*reference_velocity / 2.24)); // taking into account the frame rate and velocity
+                double x_point = x_add_on + target_x / N;
+                double y_point = s(x_point);
+
+                x_add_on = x_point;
+
+                double x_ref = x_point;
+                double y_ref = y_point;
+
+                // convert back to the global frame
+                x_point = x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw);
+                y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
+                x_point += ref_x;
+                y_point += ref_y;
+
+                // populate global trajectory
+                next_x_vals.push_back(x_point);
+                next_y_vals.push_back(y_point);
+            }
+
+            msgJson["next_x"] = next_x_vals;
+            msgJson["next_y"] = next_y_vals;
+
+
+            auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
@@ -291,82 +449,123 @@ int main() {
   h.run();
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+std::vector<double> getFrontCarProximityAndVelocitySCoordinates(const vector<vector<double>> &sensor_fusion, int lane,
+                                                                double car_s,
+                                                                int prediction_horizon,
+                                                                double lane_width,
+                                                                double lane_center_offset,
+                                                                double lane_left_boundary,
+                                                                double lane_right_boundary,
+                                                                double frame_rate) {
+
+    double front_vehicle_velocity;
+    double min_dist_to_front = std::numeric_limits<double>::max();
+
+    // handle rear-ending front vehicle
+    for (int i = 0; i < sensor_fusion.size(); i++) {
+        float d = sensor_fusion[i][6];
+        if (d < (lane_center_offset+lane_width*lane+lane_right_boundary) &&
+                d > (lane_center_offset+lane_width*lane+lane_left_boundary)) {
+            double vx = sensor_fusion[i][3];
+            double vy = sensor_fusion[i][4];
+            double check_speed = sqrt(vx*vx + vy*vy);
+            double check_car_s = sensor_fusion[i][5];
+
+            check_car_s += (double) prediction_horizon * frame_rate * check_speed;
+
+            if (check_car_s-car_s < min_dist_to_front && check_car_s-car_s > 0 ) {
+                front_vehicle_velocity = check_speed;
+                min_dist_to_front = check_car_s-car_s;
+            }
+
+        }
+    }
+    return {min_dist_to_front, front_vehicle_velocity};
+}
+
+
+bool checkCanEscapeToLane(int lane, const vector<vector<double>> &sensor_fusion,
+                          double car_s,
+                          int prediction_horizon,
+                          double critical_overtake_free_space,
+                          double lane_width,
+                          double lane_center_offset,
+                          double lane_left_boundary,
+                          double lane_right_boundary,
+                          double frame_rate) {
+    for (int i = 0; i < sensor_fusion.size(); i++) {
+
+        float d = sensor_fusion[i][6];
+        if (d < (lane_center_offset+lane_width* lane +lane_right_boundary) &&
+                d > (lane_center_offset+lane_width*lane+lane_left_boundary)) {
+
+            double vx = sensor_fusion[i][3];
+            double vy = sensor_fusion[i][4];
+            double check_speed = sqrt(vx*vx + vy*vy);
+            double check_car_s = sensor_fusion[i][5];
+
+            check_car_s += (double) prediction_horizon * frame_rate * check_speed;
+
+
+            if ((abs(check_car_s-car_s) < critical_overtake_free_space)) {
+
+                return false;
+            }
+
+        }
+    }
+
+    return true;
+}
+
+vector<vector<double>> getTwoStepTrajectoryHistory(double car_x, double car_y,
+                                                   double car_yaw, const vector<double> &previous_path_x,
+                                                   const vector<double> &previous_path_y) {
+    vector<double> ptsx;
+    vector<double> ptsy;
+    int prev_size = previous_path_x.size();
+
+    if (prev_size < 2) {
+        double prev_car_x = car_x - cos(car_yaw);
+        double prev_car_y = car_y - sin(car_yaw);
+
+        ptsx.push_back(prev_car_x);
+        ptsx.push_back(car_x);
+
+        ptsy.push_back(prev_car_y);
+        ptsy.push_back(car_y);
+    } else {
+        double ref_x = previous_path_x[prev_size-1];
+        double ref_y = previous_path_y[prev_size-1];
+
+        double ref_x_prev = previous_path_x[prev_size-2];
+        double ref_y_prev = previous_path_y[prev_size-2];
+
+        ptsx.push_back(ref_x_prev);
+        ptsx.push_back(ref_x);
+
+        ptsy.push_back(ref_y_prev);
+        ptsy.push_back(ref_y);
+    }
+
+    return {ptsx, ptsy};
+}
+
+vector<vector<double>> getXYWaypointsAtFrenetSValues(double lane,
+                                                     const vector<double> &s_vector,
+                                                     const vector<double> &map_waypoints_s,
+                                                     const vector<double> &map_waypoints_x,
+                                                     const vector<double> &map_waypoints_y,
+                                                     double lane_width, double lane_center_offset ) {
+    vector<double> x_points;
+    vector<double> y_points;
+
+    for (int i = 0; i < s_vector.size(); i++) {
+        x_points.push_back(getXY(s_vector[i], lane_center_offset + lane * lane_width, map_waypoints_s, map_waypoints_x,
+                                 map_waypoints_y)[0]);
+        y_points.push_back(getXY(s_vector[i], lane_center_offset + lane * lane_width, map_waypoints_s, map_waypoints_x,
+                                 map_waypoints_y)[1]);
+    }
+
+    return {x_points, y_points};
+}
